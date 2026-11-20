@@ -1,0 +1,131 @@
+name: Build Cobra Sentinel APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.0.0). Leave empty for build-<run number>"
+        required: false
+        default: ""
+  push:
+    paths:
+      - "source.zip"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Unzip source
+        run: |
+          mkdir -p work
+          if [ -f source.zip ]; then
+            echo "Using source.zip from this repository"
+            unzip -q source.zip -d work
+          else
+            echo "source.zip not found - downloading upstream source"
+            curl -fsSL -o upstream.zip https://github.com/CIS-C0/RFSentinel/archive/refs/heads/main.zip
+            unzip -q upstream.zip -d work
+          fi
+          GRADLEW=$(find work -maxdepth 3 -name gradlew | head -n 1)
+          if [ -z "$GRADLEW" ]; then echo "gradlew not found in source"; exit 1; fi
+          PROJECT_DIR=$(dirname "$GRADLEW")
+          chmod +x "$GRADLEW"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Project dir: $PROJECT_DIR"
+
+      - name: Apply SilentCobra branding
+        env:
+          NEW_NAME: "Cobra Sentinel"
+          NEW_ID: "com.silentcobra.cobrasentinel"
+        run: |
+          cd "$PROJECT_DIR"
+          sed -i -E "s/applicationId = \"[^\"]+\"/applicationId = \"$NEW_ID\"/" app/build.gradle.kts
+          find app/src -path "*values*" -name strings.xml -print0 | xargs -0 sed -i -E "s|(<string name=\"app_name\"[^>]*>)[^<]*(</string>)|\1$NEW_NAME\2|"
+          grep -rl "RF Sentinel" app/src --include=*.xml | xargs -r sed -i "s/RF Sentinel/$NEW_NAME/g"
+          grep -n "applicationId" app/build.gradle.kts || true
+          grep -rn 'name="app_name"' app/src --include=strings.xml || true
+          cat > NOTICE-SilentCobra.md << NOTE
+          $NEW_NAME is a modified version of RF Sentinel
+          (c) 2026 CIS-C0 - https://github.com/CIS-C0/RFSentinel
+          Modified by SilentCobra. Licensed under GPL-3.0.
+          NOTE
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Prepare signing key
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          mkdir -p keystore
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "Using signing key from repository secrets"
+            echo "$KEYSTORE_BASE64" | base64 -d > keystore/rfsentinel-release.jks
+            ALIAS="$KEY_ALIAS"; SPASS="$KEYSTORE_PASSWORD"; KPASS="${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
+          else
+            echo "::warning::No signing secrets found - generating a temporary key. Updates over a previous install will fail. Add the secrets to keep a stable key."
+            ALIAS="rfsentinel"; SPASS="$(openssl rand -hex 12)"; KPASS="$SPASS"
+            keytool -genkeypair -v -keystore keystore/rfsentinel-release.jks \
+              -alias "$ALIAS" -keyalg RSA -keysize 4096 -validity 10000 \
+              -storepass "$SPASS" -keypass "$KPASS" -dname "CN=RFSentinel Custom Build"
+          fi
+          cat > keystore.properties << PROPS
+          storeFile=keystore/rfsentinel-release.jks
+          storePassword=$SPASS
+          keyAlias=$ALIAS
+          keyPassword=$KPASS
+          PROPS
+          sed -i 's/^[[:space:]]*//' keystore.properties
+
+      - name: Build release APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Collect APK
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then TAG="build-${{ github.run_number }}"; fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          APK=$(find "$PROJECT_DIR/app/build/outputs/apk/release" -name "*.apk" | head -n 1)
+          if [ -z "$APK" ]; then echo "APK not found"; exit 1; fi
+          mkdir -p dist
+          cp "$APK" "dist/CobraSentinel-$TAG-release.apk"
+          ls -la dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CobraSentinel-apk
+          path: dist/*.apk
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: Cobra Sentinel ${{ env.TAG }}
+          body: |
+            Cobra Sentinel by SilentCobra - modified version of RF Sentinel (GPL-3.0).
+            Original project: https://github.com/CIS-C0/RFSentinel
+            Download the file ending in `-release.apk` below.
+          files: dist/*.apk
+          
