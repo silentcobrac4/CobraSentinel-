@@ -7,6 +7,10 @@ on:
         description: "Release tag (e.g. v1.0.0). Leave empty for build-<run number>"
         required: false
         default: ""
+      gradle_task:
+        description: "Gradle task (assembleRelease = all versions, assembleFossRelease = lighter build)"
+        required: false
+        default: "assembleRelease"
   push:
     paths:
       - "source.zip"
@@ -39,6 +43,23 @@ jobs:
           chmod +x "$GRADLEW"
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           echo "Project dir: $PROJECT_DIR"
+
+      - name: Fill git submodules (missing from ZIP archives)
+        run: |
+          UP="$GITHUB_WORKSPACE/upstream-src"
+          git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/CIS-C0/RFSentinel.git "$UP"
+          cd "$UP"
+          { git config -f .gitmodules --get-regexp '^submodule\..*\.path$' || true; } | awk '{print $2}' | while read -r SUB; do
+            DEST="$GITHUB_WORKSPACE/$PROJECT_DIR/$SUB"
+            if [ -z "$(ls -A "$DEST" 2>/dev/null)" ]; then
+              echo "Filling submodule: $SUB"
+              mkdir -p "$DEST"
+              cp -a "$UP/$SUB/." "$DEST/"
+            else
+              echo "Submodule already present: $SUB"
+            fi
+          done
+          ls "$GITHUB_WORKSPACE/$PROJECT_DIR/app/src/full/cpp/whisper.cpp" 2>/dev/null | head -n 5 || true
 
       - name: Apply SilentCobra branding
         env:
@@ -104,17 +125,18 @@ jobs:
 
       - name: Build release APK
         working-directory: ${{ env.PROJECT_DIR }}
-        run: ./gradlew assembleRelease --no-daemon --stacktrace
+        run: ./gradlew ${{ github.event.inputs.gradle_task || 'assembleRelease' }} --no-daemon --stacktrace
 
       - name: Collect APK
         run: |
           TAG="${{ github.event.inputs.tag }}"
           if [ -z "$TAG" ]; then TAG="build-${{ github.run_number }}"; fi
           echo "TAG=$TAG" >> "$GITHUB_ENV"
-          APK=$(find "$PROJECT_DIR/app/build/outputs/apk/release" -name "*.apk" | head -n 1)
-          if [ -z "$APK" ]; then echo "APK not found"; exit 1; fi
           mkdir -p dist
-          cp "$APK" "dist/CobraSentinel-$TAG-release.apk"
+          find "$PROJECT_DIR/app/build/outputs/apk" -name "*.apk" -path "*release*" | while read -r APK; do
+            cp "$APK" "dist/CobraSentinel-$TAG-$(basename "$APK")"
+          done
+          if [ -z "$(ls -A dist)" ]; then echo "APK not found"; exit 1; fi
           ls -la dist
 
       - name: Upload artifact
